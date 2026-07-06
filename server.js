@@ -19,7 +19,7 @@ const CORREIOS_SERVICE_PAC = "04510"; // Código do PAC
 const CORREIOS_SERVICE_SEDEX = "04014"; // Código do SEDEX
 
 // =======================================================
-// NOVA ROTA: CALCULAR FRETE REAL
+// NOVA ROTA: CALCULAR FRETE REAL (CORRIGIDA E ROBUSTA)
 // =======================================================
 app.post('/calculate_shipping', async (req, res) => {
     try {
@@ -38,11 +38,9 @@ app.post('/calculate_shipping', async (req, res) => {
         let declaredValue = 0;
 
         items.forEach(item => {
-            // Converte peso para número (ex: "5,0 KG" vira 5.0)
             const weightStr = String(item.peso).replace(/[^\d,\.]/g, '').replace(',', '.');
             totalWeight += parseFloat(weightStr) * item.qty;
             
-            // Extrai números do tamanho (ex: "62X60X23 CM" vira [62, 60, 23])
             const dimensions = String(item.tamanho).match(/\d+/g);
             if (dimensions && dimensions.length >= 3) {
                 maxLength = Math.max(maxLength, parseInt(dimensions[0]));
@@ -53,18 +51,14 @@ app.post('/calculate_shipping', async (req, res) => {
             declaredValue += item.price * item.qty;
         });
 
-        // Validar limites máximos dos Correios
         if (totalWeight > 30) {
-            return res.status(400).json({ error: "O peso total do pedido excede o limite dos Correios (30kg). Entre em contato para entrega especial." });
+            return res.status(400).json({ error: "O peso total do pedido excede o limite dos Correios (30kg)." });
         }
         if ((maxLength + maxWidth + maxHeight) > 200) {
-            return res.status(400).json({ error: "As dimensões do pedido excedem o limite dos Correios. Entre em contato para entrega especial." });
+            return res.status(400).json({ error: "As dimensões do pedido excedem o limite dos Correios." });
         }
 
-        // Correios exige peso mínimo de 0.3kg
         if (totalWeight < 0.3) totalWeight = 0.3;
-
-        // Limites mínimos dos Correios
         if (maxLength < 16) maxLength = 16;
         if (maxWidth < 11) maxWidth = 11;
         if (maxHeight < 2) maxHeight = 2;
@@ -87,12 +81,17 @@ app.post('/calculate_shipping', async (req, res) => {
             StrRetorno: 'xml'
         });
 
-        const correiosURL = `http://ws.correios.com.br/calculador/CalcPrecoPrazo.aspx?${correiosParams.toString()}`;
+        // MUDANÇA 1: Usando HTTPS e adicionando User-Agent para não ser bloqueado
+        const correiosURL = `https://ws.correios.com.br/calculador/CalcPrecoPrazo.aspx?${correiosParams.toString()}`;
         
-        // Tratamento de falha de comunicação com os Correios
         let response;
         try {
-            response = await fetch(correiosURL);
+            response = await fetch(correiosURL, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'Accept': 'application/xml'
+                }
+            });
             if (!response.ok) throw new Error("Resposta de rede não OK");
         } catch (networkError) {
             console.error('Erro de comunicação com os Correios:', networkError);
@@ -101,29 +100,40 @@ app.post('/calculate_shipping', async (req, res) => {
 
         const xmlData = await response.text();
         
+        // MUDANÇA 2: Leitor de XML ultra-robusto (não quebra com mudança de ordem das tags)
         const parseCorreiosResponse = (xml, serviceCode) => {
-            const regex = new RegExp(`<cServico>[\\s\\S]*?<Codigo>${serviceCode}<\\/Codigo>[\\s\\S]*?<Valor>(.*?)<\\/Valor>[\\s\\S]*?<PrazoEntrega>(.*?)<\\/PrazoEntrega>[\\s\\S]*?<Erro>(.*?)<\\/Erro>[\\s\\S]*?<MsgErro>(.*?)<\\/MsgErro>[\\s\\S]*?<\\/cServico>`, 's');
-            const match = xml.match(regex);
-            if (match) {
-                return {
-                    code: serviceCode,
-                    price: match[1],
-                    days: match[2],
-                    error: match[3] !== '0' ? match[4] : null
-                };
-            }
-            return null;
+            const blockRegex = new RegExp(`<cServico>[\\s\\S]*?<Codigo>${serviceCode}<\\/Codigo>([\\s\\S]*?)<\\/cServico>`, 's');
+            const blockMatch = xml.match(blockRegex);
+            if (!blockMatch) return null;
+            
+            const block = blockMatch[1];
+
+            const getValue = (tag) => {
+                const match = block.match(new RegExp(`<${tag}>(.*?)<\\/${tag}>`, 's'));
+                return match ? match[1].trim() : '';
+            };
+
+            const valor = getValue('Valor');
+            const prazo = getValue('PrazoEntrega');
+            const erro = getValue('Erro');
+            const msgErro = getValue('MsgErro');
+
+            return {
+                code: serviceCode,
+                price: valor,
+                days: prazo,
+                error: (erro !== '0' && erro !== '') ? (msgErro || `Código de erro ${erro}`) : null
+            };
         };
 
         const pac = parseCorreiosResponse(xmlData, CORREIOS_SERVICE_PAC);
         const sedex = parseCorreiosResponse(xmlData, CORREIOS_SERVICE_SEDEX);
 
         const shippingOptions = [];
-        if (pac && !pac.error) shippingOptions.push({ type: 'PAC', ...pac });
-        if (sedex && !sedex.error) shippingOptions.push({ type: 'SEDEX', ...sedex });
+        if (pac && !pac.error && pac.price) shippingOptions.push({ type: 'PAC', ...pac });
+        if (sedex && !sedex.error && sedex.price) shippingOptions.push({ type: 'SEDEX', ...sedex });
 
         if (shippingOptions.length === 0) {
-            // Se ambos falharem, verificamos qual foi o erro exato do Correios
             const errorMsg = (pac && pac.error) ? pac.error : (sedex && sedex.error) ? sedex.error : "Não foi possível calcular o frete para esta região. Verifique o CEP.";
             return res.status(400).json({ error: errorMsg });
         }
@@ -168,7 +178,6 @@ app.get('/oauth/callback', async (req, res) => {
 // ROTA PRINCIPAL - PROCESSAR PAGAMENTO 
 app.post('/process_payment', async (req, res) => {
   try {
-    // Escolhe o token (prioriza OAuth, senão usa variável de ambiente)
     let accessToken = oauthCredentials.access_token || process.env.MP_ACCESS_TOKEN;
     if (!accessToken) {
       return res.status(500).json({ error: 'Token de acesso não configurado' });
@@ -176,7 +185,6 @@ app.post('/process_payment', async (req, res) => {
 
     const { transaction_amount, description, payment_method_id, payer } = req.body;
 
-    // VALIDAÇÃO CRÍTICA: PIX exige email do comprador
     if (payment_method_id === 'pix' && (!payer || !payer.email)) {
       return res.status(400).json({ error: 'E-mail do comprador é obrigatório para PIX' });
     }
@@ -198,7 +206,6 @@ app.post('/process_payment', async (req, res) => {
       }
     };
 
-    // Se for cartão, adiciona token (não usado no PIX)
     if (req.body.token && (payment_method_id === 'credit_card' || payment_method_id === 'debit_card')) {
       paymentData.token = req.body.token;
       if (req.body.installments) paymentData.installments = req.body.installments;
@@ -209,7 +216,6 @@ app.post('/process_payment', async (req, res) => {
     const response = await payment.create({ body: paymentData });
     console.log('✅ Resposta do MP:', JSON.stringify(response, null, 2));
 
-    // Prepara resposta para o frontend
     const result = {
       id: response.id,
       status: response.status,
@@ -218,7 +224,6 @@ app.post('/process_payment', async (req, res) => {
       transaction_amount: response.transaction_amount
     };
 
-    // Inclui dados do PIX se existirem
     if (response.point_of_interaction) {
       result.point_of_interaction = response.point_of_interaction;
     }
