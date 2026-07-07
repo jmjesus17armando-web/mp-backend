@@ -12,137 +12,96 @@ app.use(cors());
 let oauthCredentials = { access_token: null };
 
 // =======================================================
-// CONFIGURAÇÕES DE FRETE (Correios)
+// TABELA DE FRETE FIXA POR ESTADO (substitui a API dos Correios)
+// A API gratuita dos Correios (CalcPrecoPrazo) foi descontinuada
+// em 30/09/2023 e só funciona para quem tem contrato ativo.
 // =======================================================
-const STORE_ORIGIN_ZIP = "13471140"; // CEP de origem da sua loja (apenas números)
-const CORREIOS_SERVICE_PAC = "04510"; // Código do PAC
-const CORREIOS_SERVICE_SEDEX = "04014"; // Código do SEDEX
 
-// =======================================================
-// NOVA ROTA: CALCULAR FRETE REAL (CORRIGIDA E ROBUSTA)
-// =======================================================
+// Mapeia os 2 primeiros dígitos do CEP para a UF
+function getUFByCep(cep) {
+    const prefix = parseInt(cep.substring(0, 2));
+    const ranges = [
+        { uf: 'SP', min: 1, max: 19 },
+        { uf: 'RJ', min: 20, max: 28 },
+        { uf: 'ES', min: 29, max: 29 },
+        { uf: 'MG', min: 30, max: 39 },
+        { uf: 'BA', min: 40, max: 48 },
+        { uf: 'SE', min: 49, max: 49 },
+        { uf: 'PE', min: 50, max: 56 },
+        { uf: 'AL', min: 57, max: 57 },
+        { uf: 'PB', min: 58, max: 58 },
+        { uf: 'RN', min: 59, max: 59 },
+        { uf: 'CE', min: 60, max: 63 },
+        { uf: 'PI', min: 64, max: 64 },
+        { uf: 'MA', min: 65, max: 65 },
+        { uf: 'PA', min: 66, max: 68 },
+        { uf: 'AP', min: 68, max: 68 },
+        { uf: 'AM', min: 69, max: 69 },
+        { uf: 'RR', min: 69, max: 69 },
+        { uf: 'AC', min: 69, max: 69 },
+        { uf: 'DF', min: 70, max: 73 },
+        { uf: 'GO', min: 72, max: 76 },
+        { uf: 'RO', min: 76, max: 76 },
+        { uf: 'TO', min: 77, max: 77 },
+        { uf: 'MT', min: 78, max: 78 },
+        { uf: 'MS', min: 79, max: 79 },
+        { uf: 'PR', min: 80, max: 87 },
+        { uf: 'SC', min: 88, max: 89 },
+        { uf: 'RS', min: 90, max: 99 },
+    ];
+    const found = ranges.find(r => prefix >= r.min && prefix <= r.max);
+    return found ? found.uf : null;
+}
+
+// Tabela de preços por região (AJUSTE os valores conforme sua realidade)
+const FREIGHT_TABLE = {
+    SP: { region: 'São Paulo', price: 15.00, days: 3 },
+    SUDESTE: { region: 'Sudeste (RJ, MG, ES)', price: 25.00, days: 5, ufs: ['RJ', 'MG', 'ES'] },
+    SUL: { region: 'Sul (PR, SC, RS)', price: 30.00, days: 6, ufs: ['PR', 'SC', 'RS'] },
+    OUTROS: { region: 'Demais regiões do Brasil', price: 40.00, days: 10 } // fallback
+};
+
+function getFreightByUF(uf) {
+    if (uf === 'SP') return FREIGHT_TABLE.SP;
+    if (FREIGHT_TABLE.SUDESTE.ufs.includes(uf)) return FREIGHT_TABLE.SUDESTE;
+    if (FREIGHT_TABLE.SUL.ufs.includes(uf)) return FREIGHT_TABLE.SUL;
+    return FREIGHT_TABLE.OUTROS;
+}
+
 app.post('/calculate_shipping', async (req, res) => {
     try {
-        const { destinationZip, items } = req.body;
-        
-        if (!destinationZip || !items || items.length === 0) {
-            return res.status(400).json({ error: "CEP de destino ou itens ausentes." });
+        const { destinationZip } = req.body;
+
+        if (!destinationZip) {
+            return res.status(400).json({ error: "CEP de destino ausente." });
         }
 
-        const sCepDestino = destinationZip.replace(/\D/g, '');
-        
-        let totalWeight = 0;
-        let maxLength = 0;
-        let maxWidth = 0;
-        let maxHeight = 0;
-        let declaredValue = 0;
-
-        items.forEach(item => {
-            const weightStr = String(item.peso).replace(/[^\d,\.]/g, '').replace(',', '.');
-            totalWeight += parseFloat(weightStr) * item.qty;
-            
-            const dimensions = String(item.tamanho).match(/\d+/g);
-            if (dimensions && dimensions.length >= 3) {
-                maxLength = Math.max(maxLength, parseInt(dimensions[0]));
-                maxWidth = Math.max(maxWidth, parseInt(dimensions[1]));
-                maxHeight = Math.max(maxHeight, parseInt(dimensions[2]));
-            }
-            
-            declaredValue += item.price * item.qty;
-        });
-
-        if (totalWeight > 30) {
-            return res.status(400).json({ error: "O peso total do pedido excede o limite dos Correios (30kg)." });
-        }
-        if ((maxLength + maxWidth + maxHeight) > 200) {
-            return res.status(400).json({ error: "As dimensões do pedido excedem o limite dos Correios." });
+        const cep = destinationZip.replace(/\D/g, '');
+        if (cep.length !== 8) {
+            return res.status(400).json({ error: "CEP inválido." });
         }
 
-        if (totalWeight < 0.3) totalWeight = 0.3;
-        if (maxLength < 16) maxLength = 16;
-        if (maxWidth < 11) maxWidth = 11;
-        if (maxHeight < 2) maxHeight = 2;
+        const uf = getUFByCep(cep);
+        if (!uf) {
+            return res.status(400).json({ error: "Não foi possível identificar o estado para este CEP." });
+        }
 
-        const correiosParams = new URLSearchParams({
-            nCdEmpresa: '',
-            sDsSenha: '',
-            nCdServico: `${CORREIOS_SERVICE_PAC},${CORREIOS_SERVICE_SEDEX}`,
-            sCepOrigem: STORE_ORIGIN_ZIP,
-            sCepDestino: sCepDestino,
-            nVlPeso: totalWeight.toFixed(1).replace('.', ','),
-            nCdFormato: '1',
-            nVlComprimento: maxLength,
-            nVlAltura: maxHeight,
-            nVlLargura: maxWidth,
-            nVlDiametro: 0,
-            sCdMaoPropria: 'n',
-            nVlValorDeclarado: declaredValue > 25 ? declaredValue.toFixed(2).replace('.', ',') : '0,00',
-            sCdAvisoRecebimento: 'n',
-            StrRetorno: 'xml'
-        });
+        const freight = getFreightByUF(uf);
 
-        // MUDANÇA 1: Usando HTTPS e adicionando User-Agent para não ser bloqueado
-        const correiosURL = `https://ws.correios.com.br/calculador/CalcPrecoPrazo.aspx?${correiosParams.toString()}`;
-        
-        let response;
-        try {
-            response = await fetch(correiosURL, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                    'Accept': 'application/xml'
+        res.json({
+            options: [
+                {
+                    type: 'ENTREGA',
+                    price: freight.price.toFixed(2).replace('.', ','),
+                    days: freight.days,
+                    region: freight.region
                 }
-            });
-            if (!response.ok) throw new Error("Resposta de rede não OK");
-        } catch (networkError) {
-            console.error('Erro de comunicação com os Correios:', networkError);
-            return res.status(503).json({ error: "O servidor dos Correios está indisponível no momento. Tente novamente em instantes." });
-        }
-
-        const xmlData = await response.text();
-        
-        // MUDANÇA 2: Leitor de XML ultra-robusto (não quebra com mudança de ordem das tags)
-        const parseCorreiosResponse = (xml, serviceCode) => {
-            const blockRegex = new RegExp(`<cServico>[\\s\\S]*?<Codigo>${serviceCode}<\\/Codigo>([\\s\\S]*?)<\\/cServico>`, 's');
-            const blockMatch = xml.match(blockRegex);
-            if (!blockMatch) return null;
-            
-            const block = blockMatch[1];
-
-            const getValue = (tag) => {
-                const match = block.match(new RegExp(`<${tag}>(.*?)<\\/${tag}>`, 's'));
-                return match ? match[1].trim() : '';
-            };
-
-            const valor = getValue('Valor');
-            const prazo = getValue('PrazoEntrega');
-            const erro = getValue('Erro');
-            const msgErro = getValue('MsgErro');
-
-            return {
-                code: serviceCode,
-                price: valor,
-                days: prazo,
-                error: (erro !== '0' && erro !== '') ? (msgErro || `Código de erro ${erro}`) : null
-            };
-        };
-
-        const pac = parseCorreiosResponse(xmlData, CORREIOS_SERVICE_PAC);
-        const sedex = parseCorreiosResponse(xmlData, CORREIOS_SERVICE_SEDEX);
-
-        const shippingOptions = [];
-        if (pac && !pac.error && pac.price) shippingOptions.push({ type: 'PAC', ...pac });
-        if (sedex && !sedex.error && sedex.price) shippingOptions.push({ type: 'SEDEX', ...sedex });
-
-        if (shippingOptions.length === 0) {
-            const errorMsg = (pac && pac.error) ? pac.error : (sedex && sedex.error) ? sedex.error : "Não foi possível calcular o frete para esta região. Verifique o CEP.";
-            return res.status(400).json({ error: errorMsg });
-        }
-
-        res.json({ options: shippingOptions });
+            ]
+        });
 
     } catch (error) {
         console.error('Erro ao calcular frete:', error);
-        res.status(500).json({ error: "Erro interno ao consultar transportadora." });
+        res.status(500).json({ error: "Erro interno ao calcular frete." });
     }
 });
 
@@ -150,7 +109,7 @@ app.post('/calculate_shipping', async (req, res) => {
 // ROTAS ORIGINAIS (OAuth e Pagamento)
 // =======================================================
 
-// Rota OAuth 
+// Rota OAuth
 app.get('/oauth/callback', async (req, res) => {
   const { code } = req.query;
   if (!code) return res.status(400).json({ error: 'Código não fornecido' });
@@ -175,7 +134,7 @@ app.get('/oauth/callback', async (req, res) => {
   }
 });
 
-// ROTA PRINCIPAL - PROCESSAR PAGAMENTO 
+// ROTA PRINCIPAL - PROCESSAR PAGAMENTO
 app.post('/process_payment', async (req, res) => {
   try {
     let accessToken = oauthCredentials.access_token || process.env.MP_ACCESS_TOKEN;
